@@ -7,20 +7,22 @@ import soundfile as sf
 from scipy.signal import butter, filtfilt
 from scipy.interpolate import interp1d
 import librosa.sequence
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
 
 # --------------------------------------------------
 # 0. 경로 설정
 # --------------------------------------------------
 midi_path = "/content/작은별.mid"
-speech_path = "/content/작은별.wav"
+speech_path = "/content/작은별 발음 정확.wav"
 output_filename = "/content/song_output_final.wav"
 
 # --------------------------------------------------
 # 1. 공통 설정
 # --------------------------------------------------
 sr = 44100
-hop_length = 512
-frame_period = 5  # ms 단위
+hop_length = 220  #MIDI 시간을 frame 단위로 바꾸기 위해서 사용된다.
+frame_period = 5  # ms 단위 (pitch shift를 하기 위해 frame단위로 다시 쪼개는데, 그때의 길이)
 trim_db = 25  # librosa trim 기준
 
 # 파일 존재 체크
@@ -36,7 +38,6 @@ def lowpass_filter(signal, cutoff, sr, order=6):
     b, a = butter(order, norm_cutoff, btype='low')
     filtered = filtfilt(b, a, signal)
     return filtered
-
 def formant_shift_spectrum(sp, ap, sr, ratio):
     """
     sp, ap: (n_frames, n_bins)
@@ -107,7 +108,7 @@ print(f"  MIDI F0 프레임 수: 원본 {len(target_f0)} -> trimmed {len(target_
 # --------------------------------------------------
 print("\n[2단계] 음성 분석")
 
-# 원본 SR로 로드 후, 22050으로 리샘플
+# 원본 SR로 로드 후, 44100으로 리샘플
 x, sr_orig = librosa.load(speech_path, sr=None)
 x_resampled = librosa.resample(x, orig_sr=sr_orig, target_sr=sr)
 
@@ -136,30 +137,33 @@ ap_trimmed = ap[first_voice_idx:]
 print(f"  WORLD 프레임 수: 원본 {len(f0)} -> trimmed {len(f0_trimmed)}")
 
 # --------------------------------------------------
-# 4. DTW (유성/무성 기반 v/uv DTW, 원래 원리 그대로)
+# 4. DTW (기준을 MIDI로 설정)
+#     - MIDI를 기준 축(axis0)
+#     - 음성을 비교 축(axis1)
 # --------------------------------------------------
-print("\n[3단계] DTW 정렬 (v/uv 기반)")
+print("\n[3단계] DTW 정렬 (v/uv 기반, 기준 = MIDI)")
 
-# source = 음성, target = MIDI
-source_voiced = (f0_trimmed > 0)
-target_voiced = (target_f0_trimmed > 0)
+# MIDI = 기준(reference), 음성 = 비교(sequence)
+ref_voiced = (target_f0_trimmed > 0)   # 기준축
+qry_voiced = (f0_trimmed > 0)          # 비교축
 
-# 비용행렬: v/uv 다르면 1, 같으면 0
-cost_matrix = (source_voiced[:, None] != target_voiced[None, :]).astype(np.float64)
+# 비용행렬: (기준축, 비교축)
+# 기존과 반대가 됨
+cost_matrix = (ref_voiced[:, None] != qry_voiced[None, :]).astype(np.float64)
 
 D, wp = librosa.sequence.dtw(C=cost_matrix)
-# (N-1, M-1) -> (0,0)로 오도록 뒤집기
 wp = np.flip(wp, axis=0)
 
-src_idx = wp[:, 0]  # 음성 프레임 인덱스
-tgt_idx = wp[:, 1]  # MIDI 프레임 인덱스
+# 이제 wp[:,0] = MIDI 프레임, wp[:,1] = 음성 프레임
+midi_idx = wp[:, 0]
+speech_idx = wp[:, 1]
 
-print(f"  DTW 경로 길이: {len(wp)}")
-print(f"  음성 trimmed 프레임: {len(f0_trimmed)}, MIDI trimmed 프레임: {len(target_f0_trimmed)}")
+# 인덱스 범위 보정
+midi_idx = np.clip(midi_idx, 0, len(target_f0_trimmed) - 1)
+speech_idx = np.clip(speech_idx, 0, len(f0_trimmed) - 1)
 
-# 인덱스 범위 안전 보정
-src_idx = np.clip(src_idx, 0, len(f0_trimmed) - 1)
-tgt_idx = np.clip(tgt_idx, 0, len(target_f0_trimmed) - 1)
+print(f"  DTW path length: {len(wp)}")
+print(f"  MIDI frames: {len(target_f0_trimmed)}, Speech frames: {len(f0_trimmed)}")
 
 # --------------------------------------------------
 # 5. 방식 B 적용:
@@ -168,21 +172,29 @@ tgt_idx = np.clip(tgt_idx, 0, len(target_f0_trimmed) - 1)
 # --------------------------------------------------
 print("\n[4단계] SP/AP/F0 warp 및 방식 B 적용")
 
-# formant 구조: 음성의 SP/AP를 그대로 사용 (시간만 DTW로 매칭)
-warped_sp = sp_trimmed[src_idx]   # (len(wp), n_bins)
-warped_ap = ap_trimmed[src_idx]
+L_midi = len(target_f0_trimmed)
+midi_to_speech = np.zeros(L_midi, dtype=int)
 
-# pitch: MIDI F0를 DTW 경로에 맞게 warp
-warped_f0_midi = target_f0_trimmed[tgt_idx]
+for i in range(L_midi):
+    # 현재 MIDI 프레임 i와 가장 가까운 DTW path 지점 찾기
+    nearest = np.argmin(np.abs(midi_idx - i))
+    midi_to_speech[i] = speech_idx[nearest]
+
+# ------------------------------
+# 🔥 최종 warp 결과는 MIDI 길이에 정확히 맞춤
+# ------------------------------
+warped_sp = sp_trimmed[midi_to_speech]
+warped_ap = ap_trimmed[midi_to_speech]
+warped_f0_midi = target_f0_trimmed   # 이미 길이 = MIDI 길이
 
 print(f"  warped_sp shape: {warped_sp.shape}")
 print(f"  warped_ap shape: {warped_ap.shape}")
 print(f"  warped_f0_midi length: {len(warped_f0_midi)}")
 
-formant_ratio = 0.8   # 예: 15% formant 상승(더 밝은 목소리)
+formant_ratio = 0.8
 warped_sp, warped_ap = formant_shift_spectrum(
-        warped_sp, warped_ap, sr, formant_ratio
-    )
+    warped_sp, warped_ap, sr, formant_ratio
+)
 print(f" - 스펙트럼/F0 정렬 완료.")
 
 # --------------------------------------------------
@@ -199,6 +211,8 @@ synthesized = pw.synthesize(
     sr,
     frame_period=frame_period
 )
+
+
 # ====== [추가: LPF 적용] =======
 cutoff_hz = 5000
 synthesized = lowpass_filter(synthesized, cutoff_hz, sr)
